@@ -53,12 +53,13 @@ class RingComm:
         self,
         k: torch.Tensor,
         v: torch.Tensor,
-        k_buffer: Optional[torch.Tensor] = None,
-        v_buffer: Optional[torch.Tensor] = None,
+        kv_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        next_k, next_v = self.send_recv(k, k_buffer), self.send_recv(v, v_buffer)
+        # 在npu上batch_isend_irecv不支持同一src device和dst device的多个isend操作
+        kv = torch.stack((k, v), dim=0)
+        next_kv = self.send_recv(kv, kv_buffer)
         self.commit()
-        return next_k, next_v
+        return next_kv[0], next_kv[1]
 
 
 class AllGatherComm:

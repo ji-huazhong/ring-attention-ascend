@@ -1,5 +1,6 @@
 from typing import Optional, Tuple
 
+from einops import rearrange
 import torch
 try:
     import torch_npu  # noqa: F401
@@ -17,9 +18,9 @@ from .utils import RingComm, printflock
 
 
 def _update_forward(
-    prev_out: Optional[torch.Tensor], 
-    prev_softmax_max: Optional[torch.Tensor], 
-    prev_softmax_sum: Optional[torch.Tensor], 
+    prev_out: Optional[torch.Tensor],         # (batch_size, seqlen, nheads, d)
+    prev_softmax_max: Optional[torch.Tensor], # (batch_size, nheads, seqlen, 8)
+    prev_softmax_sum: Optional[torch.Tensor], # (batch_size, nheads, seqlen, 8)
     cur_out: torch.Tensor, 
     cur_softmax_max: torch.Tensor, 
     cur_softmax_sum: torch.Tensor,
@@ -37,6 +38,13 @@ def _update_forward(
     # update out scale
     prev_out_scale = prev_softmax_sum_scaled / softmax_sum
     cur_out_scale = cur_softmax_sum_scaled / softmax_sum
+
+    # [b, n, s, 8] -> [b, s, n, d]
+    d = cur_out.shape[-1]
+    prev_out_scale = prev_out_scale[..., 0].unsqueeze(3).repeat(1, 1, 1, d) # [b, n, s, 1] -> [b, n, s, d]
+    prev_out_scale = rearrange(prev_out_scale, "b n s d -> b s n d").contiguous()
+    cur_out_scale = cur_out_scale[..., 0].unsqueeze(3).repeat(1, 1, 1, d)
+    cur_out_scale = rearrange(cur_out_scale, "b n s d -> b s n d").contiguous()
 
     # updata output
     out = prev_out * prev_out_scale + cur_out * cur_out_scale
@@ -160,7 +168,6 @@ class RingFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         ...
-
 
 
 def ring_flash_attn_func(

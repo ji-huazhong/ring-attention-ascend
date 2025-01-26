@@ -1,3 +1,7 @@
+"""
+torchrun --nproc_per_node=4 test_ring_flash_func.py
+"""
+
 import torch
 try:
     import torch_npu  # noqa: F401
@@ -82,7 +86,9 @@ if __name__ == "__main__":
     out_cpu = self_attention_cpu(q.cpu().float(), k.cpu().float(), v.cpu().float())
     torch.testing.assert_close(out.cpu().float(), out_cpu, rtol=1e-2, atol=1e-2)
 
+    # out is (batch_size, seqlen, nheads, d)
     local_out = out.chunk(world_size, dim=1)[rank]
+    # softmax_max shape is (batch_size, nheads, seqlen, 8)
     local_softmax_max = softmax_max.chunk(world_size, dim=2)[rank]
     local_softmax_sum = softmax_sum.chunk(world_size, dim=2)[rank]
     
