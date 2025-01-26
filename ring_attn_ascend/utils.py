@@ -1,3 +1,4 @@
+import fcntl
 from typing import Optional, Tuple
 
 import torch
@@ -27,7 +28,9 @@ class RingComm:
         else:
             res = recv_tensor
 
-        send_op = dist.P2POp(dist.isend, to_send, self.send_rank, group=self._process_group)
+        send_op = dist.P2POp(
+            dist.isend, to_send, self.send_rank, group=self._process_group
+        )
         recv_op = dist.P2POp(dist.irecv, res, self.recv_rank, group=self._process_group)
         self._ops.append(send_op)
         self._ops.append(recv_op)
@@ -73,3 +76,13 @@ class AllGatherComm:
         for handle in self.handles:
             handle.wait()
         self.handles = []
+
+
+def printflock(*msg):
+    """solves multi-process interleaved print problem"""
+    with open(__file__, "r") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            print(*msg)
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)

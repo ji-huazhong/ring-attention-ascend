@@ -7,7 +7,7 @@ except ImportError:
     print("Failed to import torch_npu.")
 import torch.distributed as dist
 
-from .utils import RingComm
+from .utils import RingComm, printflock
 
 
 # https://github.com/zhuzilin/ring-flash-attention/blob/be3b01f5706f45245f9b6d78d6df231954b2ee64/ring_flash_attn/ring_flash_attn.py
@@ -66,7 +66,6 @@ def ring_flash_attn_forward(
     k: torch.Tensor, # (batch_size, seqlen, nheads_k, headdim)
     v: torch.Tensor, # (batch_size, seqlen, nheads_k, headdim)
     softmax_scale,
-    dropout_p=0,
     attn_mask=None,
     causal=True,
 ):
@@ -84,7 +83,8 @@ def ring_flash_attn_forward(
     next_k, next_v = None, None
 
     for step in range(comm.world_size):
-        if step + 1 != comm.world_size: # 不是最后一个rank
+        printflock(f"rank-{comm.rank} step{step} start")
+        if step + 1 != comm.world_size:
             next_k, next_v = comm.send_recv_kv(k, v) # 把k,v发给下一个rank，并从上一个rank接收下一组k, v
 
         if step <= comm.rank:
@@ -93,7 +93,7 @@ def ring_flash_attn_forward(
                 k,
                 v,
                 head_num=q.shape[2],
-                input_layer="BSND",
+                input_layout="BSND",
                 atten_mask=attn_mask if step == 0 else None,
                 scale=softmax_scale,
                 pre_tockens=k.shape[1],
@@ -128,14 +128,34 @@ class RingFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        q,
-        k,
-        dropout_p,
-        softmax_scale,
-        causal,
-        group,
+        q, # (batch_size, seqlen, nheads, headdim)
+        k, # (batch_size, seqlen, nheads_k, headdim)
+        v, # (batch_size, seqlen, nheads_k, headdim)
+        softmax_scale=None,
+        attn_mask=None,
+        causal=True,
+        group=None,
     ):
-        ...
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        
+        k = k.contiguous()
+        v = v.contiguous()
+        out, softmax_max, softmax_sum = ring_flash_attn_forward(
+            group,
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            attn_mask=attn_mask,
+            causal=causal,
+        )
+        ctx.save_for_backward(q, k, v, out, softmax_max, softmax_sum)
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.group = group
+        return out, softmax_max, softmax_sum
+
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -148,6 +168,7 @@ def ring_flash_attn_func(
     k,
     v,
     softmax_scale=None,
+    attn_mask=None,
     causal=True,
     group=None,
 ):
@@ -156,6 +177,7 @@ def ring_flash_attn_func(
         k,
         v,
         softmax_scale,
+        attn_mask,
         causal,
         group,
     )
