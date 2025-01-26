@@ -128,8 +128,62 @@ def ring_flash_attn_backward(
     v,
     out,
     softmax_scale,
+    attn_mask,
+    softmax_max,
+    softmax_sum,
+    causal=True,
 ):
-    ...
+    kv_comm = RingComm(process_group)
+    d_kv_comm = RingComm(process_group)
+    dq, dk, dv = None, None, None
+    next_dk, next_dv = None, None
+
+    next_dk, next_dv = None, None
+    next_k, next_v = None, None
+
+    for step in range(kv_comm.world_size):
+        if step + 1 != kv_comm.world_size:
+            next_k, next_v = kv_comm.send_recv_kv(k, v)
+
+        if step <= kv_comm.rank:
+            attn_grad_outs = torch_npu.npu_fusion_attention_grad(
+                q,
+                k,
+                v,
+                dout,
+                head_num=q.shape[2],
+                input_layout="BSND",
+                atten_mask=attn_mask if step == 0 else None,
+                softmax_max=softmax_max,
+                softmax_sum=softmax_sum,
+                attention_in=out,
+                scale_value=softmax_scale,
+                pre_tockens=k.shape[1],
+                next_tockens=0,
+            )
+
+            if dq is None:
+                dq = attn_grad_outs[0].to(torch.float32)
+                dk = attn_grad_outs[1].to(torch.float32)
+                dv = attn_grad_outs[2].to(torch.float32)
+            else:
+                dq += attn_grad_outs[0]
+                d_kv_comm.wait()
+                dk = attn_grad_outs[1] + next_dk
+                dv = attn_grad_outs[2] + next_dv
+        elif step != 0:
+            d_kv_comm.wait()
+            dk, dv = next_dk, next_dv
+
+        if step + 1 != kv_comm.world_size:
+            kv_comm.wait()
+            k, v = next_k, next_v
+
+        next_dk, next_dv = d_kv_comm.send_recv_kv(dk, dv)
+
+    d_kv_comm.wait()
+
+    return dq.to(q.dtype), next_dk.to(q.dtype), next_dv.to(q.dtype)
 
 
 class RingFlashAttnFunc(torch.autograd.Function):
