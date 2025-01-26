@@ -1,7 +1,33 @@
+import fcntl
 from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
+
+
+def flatten_softmax(x, sub_seq_lens):
+    orig_shape = x.shape
+    section_len = [s * orig_shape[1] for s in sub_seq_lens]
+    splits = x.view(-1, orig_shape[-1]).split(section_len, dim=0)
+    merged = [item.view(orig_shape[1], -1, orig_shape[-1]).transpose(0, 1) for item in splits]
+    merged = torch.cat(merged, dim=0)
+    return merged
+
+
+def unflatten_softmax(x, cu_seqlens):
+    orig_shape = x.shape
+    x_seq_list = []
+    for i in range(len(cu_seqlens) - 1):
+        start, end = cu_seqlens[i], cu_seqlens[i+1]
+        x_seq_list.append(x[start:end].transpose(1, 0).reshape(-1, orig_shape[-2], orig_shape[-1]))
+    return torch.cat(x_seq_list, dim=0)
+
+
+def get_sub_seq_lens(cu_seqlens):
+    sub_seq_lens = []
+    for i in range(len(cu_seqlens) - 1):
+        sub_seq_lens.append(cu_seqlens[i+1] - cu_seqlens[i])
+    return sub_seq_lens
 
 
 class RingComm:
@@ -27,7 +53,9 @@ class RingComm:
         else:
             res = recv_tensor
 
-        send_op = dist.P2POp(dist.isend, to_send, self.send_rank, group=self._process_group)
+        send_op = dist.P2POp(
+            dist.isend, to_send, self.send_rank, group=self._process_group
+        )
         recv_op = dist.P2POp(dist.irecv, res, self.recv_rank, group=self._process_group)
         self._ops.append(send_op)
         self._ops.append(recv_op)
@@ -50,12 +78,13 @@ class RingComm:
         self,
         k: torch.Tensor,
         v: torch.Tensor,
-        k_buffer: Optional[torch.Tensor] = None,
-        v_buffer: Optional[torch.Tensor] = None,
+        kv_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        next_k, next_v = self.send_recv(k, k_buffer), self.send_recv(v, v_buffer)
+        # 在npu上batch_isend_irecv不支持同一src device和dst device的多个isend操作
+        kv = torch.stack((k, v), dim=0)
+        next_kv = self.send_recv(kv, kv_buffer)
         self.commit()
-        return next_k, next_v
+        return next_kv[0], next_kv[1]
 
 
 class AllGatherComm:
@@ -73,3 +102,13 @@ class AllGatherComm:
         for handle in self.handles:
             handle.wait()
         self.handles = []
+
+
+def printflock(*msg):
+    """solves multi-process interleaved print problem"""
+    with open(__file__, "r") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            print(*msg)
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
