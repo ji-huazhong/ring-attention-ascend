@@ -8,13 +8,7 @@ except ImportError:
     print("Failed to import torch_npu.")
 import torch.distributed as dist
 
-from .utils import RingComm, printflock
-
-
-# https://github.com/zhuzilin/ring-flash-attention/blob/be3b01f5706f45245f9b6d78d6df231954b2ee64/ring_flash_attn/ring_flash_attn.py
-# https://github.com/zouzias/ascend-op-plugin/blob/95b06297ee18d84746a4f11cbe99ea89ea9448a8/op_plugin/ops/v2r1/opapi/FlashAttentionKernelNpuOpApi.cpp#L248
-# https://github.com/cosdt/op-plugin/blob/c8e7f492244dc4b56c040dac9db22420b8592ff6/test/test_custom_ops/test_npu_flash_attention_grad.py#L70
-# https://gitee.com/ascend/MindSpeed/pulls/138/files
+from .utils import RingComm
 
 
 def _update_forward(
@@ -79,10 +73,6 @@ def ring_flash_attn_forward(
 ):
     assert causal == True, "causal==false is not supported."
 
-    if causal and attn_mask is None:
-        attn_mask = torch.ones((q.shape[1], k.shape[1]), dtype=torch.bool, device=q.device)
-        attn_mask = torch.triu(attn_mask, diagonal=1)
-
     comm = RingComm(process_group)
 
     out = None
@@ -91,7 +81,6 @@ def ring_flash_attn_forward(
     next_k, next_v = None, None
 
     for step in range(comm.world_size):
-        printflock(f"rank-{comm.rank} step{step} start")
         if step + 1 != comm.world_size:
             next_k, next_v = comm.send_recv_kv(k, v) # 把k,v发给下一个rank，并从上一个rank接收下一组k, v
 
@@ -128,8 +117,62 @@ def ring_flash_attn_backward(
     v,
     out,
     softmax_scale,
+    attn_mask,
+    softmax_max,
+    softmax_sum,
+    causal=True,
 ):
-    ...
+    kv_comm = RingComm(process_group)
+    d_kv_comm = RingComm(process_group)
+    dq, dk, dv = None, None, None
+    next_dk, next_dv = None, None
+
+    next_dk, next_dv = None, None
+    next_k, next_v = None, None
+
+    for step in range(kv_comm.world_size):
+        if step + 1 != kv_comm.world_size:
+            next_k, next_v = kv_comm.send_recv_kv(k, v)
+
+        if step <= kv_comm.rank:
+            attn_grad_outs = torch_npu.npu_fusion_attention_grad(
+                q,
+                k,
+                v,
+                dout,
+                head_num=q.shape[2],
+                input_layout="BSND",
+                atten_mask=attn_mask if step == 0 else None,
+                softmax_max=softmax_max,
+                softmax_sum=softmax_sum,
+                attention_in=out,
+                scale_value=softmax_scale,
+                pre_tockens=k.shape[1],
+                next_tockens=0,
+            )
+
+            if dq is None:
+                dq = attn_grad_outs[0].to(torch.float32)
+                dk = attn_grad_outs[1].to(torch.float32)
+                dv = attn_grad_outs[2].to(torch.float32)
+            else:
+                dq += attn_grad_outs[0]
+                d_kv_comm.wait()
+                dk = attn_grad_outs[1] + next_dk
+                dv = attn_grad_outs[2] + next_dv
+        elif step != 0:
+            d_kv_comm.wait()
+            dk, dv = next_dk, next_dv
+
+        if step + 1 != kv_comm.world_size:
+            kv_comm.wait()
+            k, v = next_k, next_v
+
+        next_dk, next_dv = d_kv_comm.send_recv_kv(dk, dv)
+
+    d_kv_comm.wait()
+
+    return dq.to(q.dtype), next_dk.to(q.dtype), next_dv.to(q.dtype)
 
 
 class RingFlashAttnFunc(torch.autograd.Function):
@@ -146,6 +189,10 @@ class RingFlashAttnFunc(torch.autograd.Function):
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
+
+        if causal and attn_mask is None:
+            attn_mask = torch.ones((q.shape[1], k.shape[1]), dtype=torch.bool, device=q.device)
+            attn_mask = torch.triu(attn_mask, diagonal=1)
         
         k = k.contiguous()
         v = v.contiguous()
@@ -160,6 +207,7 @@ class RingFlashAttnFunc(torch.autograd.Function):
         )
         ctx.save_for_backward(q, k, v, out, softmax_max, softmax_sum)
         ctx.softmax_scale = softmax_scale
+        ctx.attn_mask = attn_mask
         ctx.causal = causal
         ctx.group = group
         return out, softmax_max, softmax_sum
@@ -167,7 +215,20 @@ class RingFlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        ...
+        q, k, v, out, softmax_max, softmax_sum = ctx.saved_tensors
+        dq, dk, dv = ring_flash_attn_backward(
+            ctx.group,
+            dout,
+            q,
+            k,
+            v,
+            out,
+            ctx.softmax_scale,
+            attn_mask=ctx.attn_mask,
+            softmax_max=softmax_max,
+            softmax_sum=softmax_sum,
+        )
+        return dq, dk, dv, None, None, None, None
 
 
 def ring_flash_attn_func(

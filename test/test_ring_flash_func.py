@@ -56,9 +56,13 @@ if __name__ == "__main__":
     dist.broadcast(k, src=0)
     dist.broadcast(v, src=0)
 
+    dout = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    dist.broadcast(dout, src=0)
+
     local_q = q.chunk(world_size, dim=1)[rank].detach().clone()
     local_k = k.chunk(world_size, dim=1)[rank].detach().clone()
     local_v = v.chunk(world_size, dim=1)[rank].detach().clone()
+    local_dout = dout.chunk(world_size, dim=1)[rank].detach().clone()
     local_q.requires_grad = True
     local_k.requires_grad = True
     local_v.requires_grad = True
@@ -108,3 +112,24 @@ if __name__ == "__main__":
     log("ss diff", local_softmax_sum - ring_softmax_sum)
 
     dist.barrier()
+    if rank == 0:
+        print("#" * 30)
+        print("# backward:")
+        print("#" * 30)
+
+    out.backward(dout)
+    dq = q.grad
+    dk = k.grad
+    dv = v.grad
+    local_dq = dq.chunk(world_size, dim=1)[rank]
+    local_dk = dk.chunk(world_size, dim=1)[rank]
+    local_dv = dv.chunk(world_size, dim=1)[rank]
+
+    ring_out.backward(local_dout)
+    ring_dq = local_q.grad
+    ring_dk = local_k.grad
+    ring_dv = local_v.grad
+
+    log("dq diff", local_dq - ring_dq)
+    log("dk diff", local_dk - ring_dk)
+    log("dv diff", local_dv - ring_dv)
