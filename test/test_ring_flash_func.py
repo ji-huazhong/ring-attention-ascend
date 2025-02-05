@@ -40,7 +40,7 @@ if __name__ == "__main__":
     device = torch.device(f"npu:{rank}")
 
     batch_size = 1
-    seqlen = 32
+    seqlen = 3816
     nheads = 5
     d = 128
     dropout_p = 0
