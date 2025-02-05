@@ -19,6 +19,10 @@ def _update_forward(
     cur_softmax_max: torch.Tensor, 
     cur_softmax_sum: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+    cur_softmax_max= cur_softmax_max[..., 0].transpose(-2, -1).unsqueeze(dim=-1) # b n s 8 -> b s n 1
+    cur_softmax_sum= cur_softmax_sum[..., 0].transpose(-2, -1).unsqueeze(dim=-1) # b n s 8 -> b s n 1
+
     # update softmax max
     softmax_max = torch.maximum(prev_softmax_max, cur_softmax_max)
     
@@ -33,12 +37,10 @@ def _update_forward(
     prev_out_scale = prev_softmax_sum_scaled / softmax_sum
     cur_out_scale = cur_softmax_sum_scaled / softmax_sum
 
-    # [b, n, s, 8] -> [b, s, n, d]
+    # [b, s, n, 1] -> [b, s, n, d]
     d = cur_out.shape[-1]
-    prev_out_scale = prev_out_scale[..., 0].unsqueeze(3).repeat(1, 1, 1, d) # [b, n, s, 1] -> [b, n, s, d]
-    prev_out_scale = rearrange(prev_out_scale, "b n s d -> b s n d").contiguous()
-    cur_out_scale = cur_out_scale[..., 0].unsqueeze(3).repeat(1, 1, 1, d)
-    cur_out_scale = rearrange(cur_out_scale, "b n s d -> b s n d").contiguous()
+    prev_out_scale = prev_out_scale.repeat(1, 1, 1, d).contiguous()
+    cur_out_scale = cur_out_scale.repeat(1, 1, 1, d).contiguous()
 
     # updata output
     out = prev_out * prev_out_scale + cur_out * cur_out_scale
@@ -55,8 +57,9 @@ def update_forward(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         out = block_out.to(torch.float32)
-        mqk = block_mqk
-        se = block_se
+        # [b, n, s, 8] -> [b, s, n, 1]
+        mqk = block_mqk[..., 0].transpose(-2, -1).unsqueeze(dim=-1) 
+        se = block_se[..., 0].transpose(-2, -1).unsqueeze(dim=-1)
     else:
         out, mqk, se = _update_forward(out, mqk, se, block_out, block_mqk, block_se)
     return out, mqk, se
@@ -105,6 +108,9 @@ def ring_flash_attn_forward(
             k, v = next_k, next_v
     
     out = out.to(q.dtype)
+    # [b s n 1] -> [b n s 8]
+    mqk = mqk.squeeze(dim=-1).transpose(1, 2).unsqueeze(dim=-1).repeat(1, 1, 1, 8)
+    se = se.squeeze(dim=-1).transpose(1, 2).unsqueeze(dim=-1).repeat(1, 1, 1, 8)
     return out, mqk, se
 
 
