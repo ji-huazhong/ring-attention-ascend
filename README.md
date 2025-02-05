@@ -1,5 +1,11 @@
 # mini-ring-attn
 
+## TODO
+
+- [ ] 支持变长序列
+- [ ] 支持zigzag模式
+
+
 ## Reference
 
 - https://github.com/zhuzilin/ring-flash-attention/blob/be3b01f5706f45245f9b6d78d6df231954b2ee64/ring_flash_attn/ring_flash_attn.py
