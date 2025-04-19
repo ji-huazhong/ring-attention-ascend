@@ -125,7 +125,6 @@ def ring_flash_attn_backward(
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
     dq, dk, dv = None, None, None
-    next_dk, next_dv = None, None
 
     next_dk, next_dv = None, None
     next_k, next_v = None, None
