@@ -46,19 +46,19 @@ def _update_forward(
 
 def update_forward(
     out: Optional[torch.Tensor], 
-    mqk: Optional[torch.Tensor], 
-    se: Optional[torch.Tensor], 
+    softmax_max: Optional[torch.Tensor], 
+    softmax_sum: Optional[torch.Tensor], 
     block_out: torch.Tensor, 
-    block_mqk: torch.Tensor, 
-    block_se: torch.Tensor,
+    block_softmax_max: torch.Tensor, 
+    block_softmax_sum: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         out = block_out.to(torch.float32)
-        mqk = block_mqk
-        se = block_se
+        softmax_max = block_softmax_max
+        softmax_sum = block_softmax_sum
     else:
-        out, mqk, se = _update_forward(out, mqk, se, block_out, block_mqk, block_se)
-    return out, mqk, se
+        out, softmax_max, softmax_sum = _update_forward(out, softmax_max, softmax_sum, block_out, block_softmax_max, block_softmax_sum)
+    return out, softmax_max, softmax_sum
 
 
 def zigzag_ring_flash_attn_forward(
@@ -77,8 +77,8 @@ def zigzag_ring_flash_attn_forward(
     q1 = q[:, block_seq_len:]
 
     out = None
-    mqk = None
-    se = None
+    softmax_max = None
+    softmax_sum = None
     next_k, next_v = None, None
 
     def forward(q, k, v, causal):
@@ -94,51 +94,138 @@ def zigzag_ring_flash_attn_forward(
             next_tockens=0,
             keep_prob=1,
         )
-        block_out, block_mqk, block_se, _, _, _, _ = outs
-        return block_out, block_mqk, block_se
+        block_out, block_softmax_max, block_softmax_sum, _, _, _, _ = outs
+        return block_out, block_softmax_max, block_softmax_sum
     
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
             next_k, next_v = comm.send_recv_kv(k, v)
         
         if step == 0:
-            block_out, block_mqk, block_se = forward(q, k, v, causal=True)
-            out, mqk, se = update_forward(out, mqk, se, block_out, block_mqk, block_se)
+            block_out, block_softmax_max, block_softmax_sum = forward(q, k, v, causal=True)
+            out, softmax_max, softmax_sum = update_forward(out, softmax_max, softmax_sum, block_out, block_softmax_max, block_softmax_sum)
         elif step <= comm.rank:
             k0 = k[:, :block_seq_len]
             v0 = v[:, :block_seq_len]
-            block_out, block_mqk, block_se = forward(q, k0, v0, causal=False)
-            out, mqk, se = update_forward(out, mqk, se, block_out, block_mqk, block_se)
+            block_out, block_softmax_max, block_softmax_sum = forward(q, k0, v0, causal=False)
+            out, softmax_max, softmax_sum = update_forward(out, softmax_max, softmax_sum, block_out, block_softmax_max, block_softmax_sum)
         else:
-            block_out, block_mqk, block_se = forward(q1, k, v, causal=False)
+            block_out, block_softmax_max, block_softmax_sum = forward(q1, k, v, causal=False)
             # [b, s, n, d] -> [b, 2, s//2, n, d]
             out = out.view(out.shape[0], 2, out.shape[1]//2, out.shape[2], out.shape[-1])
             # [b, n, s, 8] -> [b, n, 2, s//2, 8]
-            mqk = mqk.view(mqk.shape[0], mqk.shape[1], 2, mqk.shape[2]//2, mqk.shape[-1])
-            se = se.view(se.shape[0], se.shape[1], 2, se.shape[2]//2, se.shape[-1])
-            updated_out, updated_mqk, updated_se = update_forward(
+            softmax_max = softmax_max.view(softmax_max.shape[0], softmax_max.shape[1], 2, softmax_max.shape[2]//2, softmax_max.shape[-1])
+            softmax_sum = softmax_sum.view(softmax_sum.shape[0], softmax_sum.shape[1], 2, softmax_sum.shape[2]//2, softmax_sum.shape[-1])
+            updated_out, updated_softmax_max, updated_softmax_sum = update_forward(
                 out[:, 1], 
-                mqk[:, :, 1], 
-                se[:, :, 1],
+                softmax_max[:, :, 1], 
+                softmax_sum[:, :, 1],
                 block_out,
-                block_mqk,
-                block_se,
+                block_softmax_max,
+                block_softmax_sum,
             )
             out[:, 1].copy_(updated_out)
-            mqk[:, :, 1].copy_(updated_mqk)
-            se[:, :, 1].copy_(updated_se)
+            softmax_max[:, :, 1].copy_(updated_softmax_max)
+            softmax_sum[:, :, 1].copy_(updated_softmax_sum)
             # [b, 2, s//2, n, d] -> [b, s, n, d]
             out = out.view(out.shape[0], -1, out.shape[-2], out.shape[-1])
             # [b, n, 2, s//2, 8] -> [b, n, s, 8]
-            mqk = mqk.view(mqk.shape[0], mqk.shape[1], -1, mqk.shape[-1])
-            se = se.view(se.shape[0], se.shape[1], -1, se.shape[-1])
+            softmax_max = softmax_max.view(softmax_max.shape[0], softmax_max.shape[1], -1, softmax_max.shape[-1])
+            softmax_sum = softmax_sum.view(softmax_sum.shape[0], softmax_sum.shape[1], -1, softmax_sum.shape[-1])
 
         if step + 1 != comm.world_size:
             comm.wait()
             k, v = next_k, next_v
     
     out = out.to(q.dtype)
-    return out, mqk, se
+    return out, softmax_max, softmax_sum
+
+
+def zigzag_ring_flash_attn_backward(
+    process_group,
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_max,
+    softmax_sum,
+    softmax_scale,
+    attn_mask,
+    causal=True,
+):
+    assert causal == True, "zigzag is meaningless for causal=False"
+    kv_comm = RingComm(process_group)
+    d_kv_comm = RingComm(process_group)
+    dq, dk, dv = None, None, None
+    next_dk, next_dv = None, None
+    next_k, next_v = None, None
+    dk_comm_buffer, dv_comm_buffer = None, None
+
+    dout1 = dout.chunk(2, dim=1)[1]
+    q1 = q.chunk(2, dim=1)[1]
+    out1 = out.chunk(2, dim=1)[1]
+    softmax_max1 = softmax_max.chunk(2, dim=2)[1].contiguous()
+    softmax_sum1 = softmax_sum.chunk(2, dim=2)[1].contiguous()
+    block_seq_len = q.shape[1] // 2
+
+    def backward(dout, q, k, v, out, softmax_max, softmax_sum, causal):
+        return torch_npu.npu_fusion_attention_grad(
+            q,
+            k,
+            v,
+            dout,
+            head_num=q.shape[2],
+            input_layout="BSND",
+            atten_mask=attn_mask if causal else None,
+            softmax_max=softmax_max,
+            softmax_sum=softmax_sum,
+            attention_in=out,
+            scale_value=softmax_scale,
+            pre_tockens=k.shape[1],
+            next_tockens=0,
+        )
+    
+    for step in range(kv_comm.world_size):
+        if step + 1 != kv_comm.world_size:
+            next_k, next_v = kv_comm.send_recv_kv(k, v)
+        
+        if step == 0:
+            grad_outs = backward(dout, q, k, v, out, softmax_max, softmax_sum, causal=True)
+            dq = grad_outs[0].to(torch.float32)
+            dk = grad_outs[0].to(torch.float32)
+            dv = grad_outs[0].to(torch.float32)
+        else:
+            if step <= kv_comm.rank:
+                k0 = k[:, :block_seq_len]
+                v0 = k[:, :block_seq_len]
+                grad_outs = backward(dout, q, k0, v0, out, softmax_max, softmax_sum, causal=False)
+                dq += grad_outs[0]
+            else:
+                grad_outs = backward(dout1, q1, k, v, out1, softmax_max1, softmax_sum1, causal=False)
+                dq[:, block_seq_len:] += grad_outs[0][:, :block_seq_len]
+            
+            d_kv_comm.wait()
+            dk_comm_buffer, dv_comm_buffer = dk, dv
+            dk, dv = next_dk, next_dv
+
+            if step <= kv_comm.rank:
+                dk[:, :block_seq_len] += grad_outs[1][:, :block_seq_len]
+                dv[:, :block_seq_len] += grad_outs[2][:, :block_seq_len]
+            else:
+                dk += grad_outs[1]
+                dv += grad_outs[2]
+            
+        if step + 1 != kv_comm.world_size:
+            kv_comm.wait()
+            k, v = next_k, next_v
+        
+        dkv_comm_buffer = torch.stack((dk_comm_buffer, dv_comm_buffer), dim=0)
+        next_dk, next_dv = d_kv_comm.send_recv_kv(dk, dv, dkv_comm_buffer)
+    
+    d_kv_comm.wait()
+
+    return dq.to(q.dtype), next_dk.to(q.dtype), next_dv.to(q.dtype)
 
 
 class ZigZagRingFlashAttnFunc(torch.autograd.Function):

@@ -85,7 +85,7 @@ if __name__ == "__main__":
     )
 
     local_out = extract_local(out, rank, world_size)
-    # softmax_max shape is (batch_size, nheads, seqlen, 8)
+    # softmax_max shape is [batch_size, nheads, seqlen, 8]
     local_softmax_max = extract_local(softmax_max, rank, world_size, dim=2)
     local_softmax_sum = extract_local(softmax_sum, rank, world_size, dim=2)
     
@@ -100,7 +100,7 @@ if __name__ == "__main__":
     log("softmax sum", softmax_sum, rank0_only=True)
     log("out diff", local_out - ring_out)
     log("softmax max diff", local_softmax_max - ring_softmax_max)
-    log("softmax sum", local_softmax_sum - ring_softmax_sum)
+    log("softmax sum diff", local_softmax_sum - ring_softmax_sum)
 
     dist.barrier()
     if rank == 0:
@@ -124,4 +124,3 @@ if __name__ == "__main__":
     log("dq diff", local_dq - ring_dq)
     log("dk diff", local_dk - ring_dk)
     log("dv diff", local_dv - ring_dv)
-    
