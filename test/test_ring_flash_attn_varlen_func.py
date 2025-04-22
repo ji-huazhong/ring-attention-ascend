@@ -1,0 +1,161 @@
+"""
+torchrun --nproc_per_node=8 test_ring_flash_attn_varlen_func.py
+"""
+import torch
+try:
+    import torch_npu  # noqa: F401
+except ImportError:
+    print("Failed to import torch_npu.")
+import torch.distributed as dist
+
+from ring_attn_ascend import ring_flash_attn_varlen_func
+from utils import log, set_seed
+
+
+def extract_local(value, cu_seqlens, rank, world_size):
+    local_values = []
+    for i in range(len(cu_seqlens) - 1):
+        start, end = cu_seqlens[i], cu_seqlens[i+1]
+        local_value = value[start: end].chunk(world_size, dim=0)[rank].detach().clone()
+        local_values.append(local_value)
+    return torch.cat(local_values, dim=0).contiguous()
+
+
+def extract_softmax_value(softmax_value, cu_seqlens):
+    values = []
+    for i in range(len(cu_seqlens) - 1):
+        start, end = cu_seqlens[i], cu_seqlens[i+1]
+        value = softmax_value[start: end]
+        values.append(value)
+    return values
+
+
+def flatten_softmax(x, sub_seq_len):
+    orig_shape = x.shape
+    section_len = [s * orig_shape[1] for s in sub_seq_len]
+    splits = x.view(-1, orig_shape[-1]).split(section_len, dim=0)
+    merged = [item.view(orig_shape[1], -1, orig_shape[-1]).transpose(0, 1) for item in splits]
+    merged = torch.cat(merged, dim=0)
+    return merged
+
+
+def get_sub_seq_lens(cu_seqlens):
+    sub_seq_lens = []
+    for i in range(len(cu_seqlens) - 1):
+        sub_seq_lens.append(cu_seqlens[i+1] - cu_seqlens[i])
+    return sub_seq_lens
+
+
+if __name__ == "__main__":
+    dist.init_process_group("hccl")
+    rank = dist.get_rank()
+    set_seed(rank)
+    world_size = dist.get_world_size()
+    dtype = torch.bfloat16
+    device = torch.device(f"npu:{rank}")
+
+    nheads = 5
+    d = 128
+    dropout_p = 0
+    causal = True
+
+    cu_seqlens = [0, 120, 1248, 4232]
+    cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    sub_seq_lens = get_sub_seq_lens(cu_seqlens)
+    total_length = cu_seqlens[-1]
+
+    assert torch.all(cu_seqlens_tensor % world_size == 0)
+    assert d % 8 == 0
+
+    q = torch.randn(total_length, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(total_length, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(total_length, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    dist.broadcast(q, src=0)
+    dist.broadcast(k, src=0)
+    dist.broadcast(v, src=0)
+
+    dout = torch.randn(total_length, nheads, d, device=device, dtype=dtype)
+    dist.broadcast(dout, src=0)
+
+    local_cu_seqlens_tensor = cu_seqlens_tensor // world_size
+    local_sub_seq_lens = get_sub_seq_lens(local_cu_seqlens_tensor)
+
+    local_q = extract_local(q, cu_seqlens, rank, world_size)
+    local_k = extract_local(k, cu_seqlens, rank, world_size)
+    local_v = extract_local(v, cu_seqlens, rank, world_size)
+    local_q.requires_grad = True
+    local_k.requires_grad = True
+    local_v.requires_grad = True
+    local_dout = extract_local(dout, cu_seqlens, rank, world_size)
+
+    dist.barrier()
+    if rank == 0:
+        print("#" * 30)
+        print("# forward:")
+        print("#" * 30)
+
+    attn_mask = torch.triu(torch.ones([2048, 2048]), diagonal=1).bool().to(q.device)
+    out, softmax_max, softmax_sum, _, _, _, _ = torch_npu.npu_fusion_attention(
+        q,
+        k,
+        v,
+        head_num=q.shape[1],
+        input_layout="TND",
+        atten_mask=attn_mask,
+        scale=d ** (-0.5),
+        actual_seq_qlen=tuple(cu_seqlens_tensor[1:].cpu().numpy().tolist()),
+        actual_seq_kvlen=tuple(cu_seqlens_tensor[1:].cpu().numpy().tolist()),
+        sparse_mode=3,
+        keep_prob=1.0-dropout_p,
+    )
+
+    local_out = extract_local(out, cu_seqlens, rank, world_size)
+
+    softmax_max = flatten_softmax(softmax_max, sub_seq_lens)
+    local_softmax_max_list = extract_softmax_value(softmax_max, cu_seqlens)
+    softmax_sum = flatten_softmax(softmax_sum, sub_seq_lens)
+    local_softmax_sum_list = extract_softmax_value(softmax_sum, cu_seqlens)
+
+    ring_out, ring_softmax_max, ring_softmax_sum = ring_flash_attn_varlen_func(
+        local_q,
+        local_k,
+        local_v,
+        local_cu_seqlens_tensor,
+        causal=causal,
+    )
+
+    ring_softmax_max = flatten_softmax(ring_softmax_max, local_sub_seq_lens)
+    ring_softmax_max_list = extract_softmax_value(ring_softmax_max, local_cu_seqlens_tensor)
+    ring_softmax_sum = flatten_softmax(ring_softmax_sum, local_sub_seq_lens)
+    ring_softmax_sum_list = extract_softmax_value(ring_softmax_sum, local_cu_seqlens_tensor)
+
+    log("out diff", local_out - ring_out)
+    for lsm, ring_lsm in zip(local_softmax_max_list, ring_softmax_max_list):
+        local_lsm = lsm.chunk(world_size, dim=0)[rank]
+        log("softmax max diff", local_lsm - ring_lsm)
+    for lss, ring_lss in zip(local_softmax_sum_list, ring_softmax_sum_list):
+        local_lss = lss.chunk(world_size, dim=0)[rank]
+        log("softmax max diff", local_lss - ring_lss)
+
+    dist.barrier()
+    if rank == 0:
+        print("#" * 30)
+        print("# forward:")
+        print("#" * 30)
+    
+    out.backward(dout)
+    dq = q.grad
+    dk = k.grad
+    dv = v.grad
+    local_dq = extract_local(dq, cu_seqlens, rank, world_size)
+    local_dk = extract_local(dk, cu_seqlens, rank, world_size)
+    local_dv = extract_local(dv, cu_seqlens, rank, world_size)
+
+    ring_out.backward(local_dout)
+    ring_dq = local_q.grad
+    ring_dk = local_k.grad
+    ring_dv = local_v.grad
+
+    log("dq diff", local_dq - ring_dq)
+    log("dk diff", local_dk - ring_dk)
+    log("dv diff", local_dv - ring_dv)

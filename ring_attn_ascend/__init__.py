@@ -1,2 +1,3 @@
 from .ring_flash_attn import ring_flash_attn_func
+from .ring_flash_attn_varlen import ring_flash_attn_varlen_func
 from .zigzag_ring_flash_attn import zigzag_ring_flash_attn_func
