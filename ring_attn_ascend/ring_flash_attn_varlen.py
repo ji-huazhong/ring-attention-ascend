@@ -10,12 +10,13 @@ from .utils import RingComm
 
 
 def _update_forward(
-    prev_out: Optional[torch.Tensor],         # (batch_size, seqlen, nheads, d)
-    prev_softmax_max: Optional[torch.Tensor], # (batch_size, nheads, seqlen, 8)
-    prev_softmax_sum: Optional[torch.Tensor], # (batch_size, nheads, seqlen, 8)
+    prev_out: Optional[torch.Tensor],         # (total_length, nheads, hidden_dim)
+    prev_softmax_max: Optional[torch.Tensor], # (total_length, nheads, 8)
+    prev_softmax_sum: Optional[torch.Tensor], # (total_length, nheads, 8)
     cur_out: torch.Tensor, 
     cur_softmax_max: torch.Tensor, 
     cur_softmax_sum: torch.Tensor,
+    sub_seq_lens,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # update softmax max
     softmax_max = torch.maximum(prev_softmax_max, cur_softmax_max)
@@ -31,12 +32,11 @@ def _update_forward(
     prev_out_scale = prev_softmax_sum_scaled / softmax_sum
     cur_out_scale = cur_softmax_sum_scaled / softmax_sum
 
-    # [b, n, s, 8] -> [b, s, n, d]
-    d = cur_out.shape[-1]
-    prev_out_scale = prev_out_scale[..., 0].unsqueeze(3).repeat(1, 1, 1, d) # [b, n, s, 1] -> [b, n, s, d]
-    prev_out_scale = rearrange(prev_out_scale, "b n s d -> b s n d").contiguous()
-    cur_out_scale = cur_out_scale[..., 0].unsqueeze(3).repeat(1, 1, 1, d)
-    cur_out_scale = rearrange(cur_out_scale, "b n s d -> b s n d").contiguous()
+    # (total_length, nheads, 8) -> (total_length, nheads, 1)
+    prev_out_scale = flatten_softmax(prev_out_scale, sub_seq_lens)
+    cur_out_scale = flatten_softmax(cur_out_scale, sub_seq_lens)
+    prev_out_scale = prev_out_scale[..., 0].unsqueeze(2)
+    cur_out_scale = cur_out_scale[..., 0].unsqueeze(2)
 
     # updata output
     out = prev_out * prev_out_scale + cur_out * cur_out_scale
@@ -45,34 +45,57 @@ def _update_forward(
 
 def update_forward(
     out: Optional[torch.Tensor], 
-    mqk: Optional[torch.Tensor], 
-    se: Optional[torch.Tensor], 
+    softmax_max: Optional[torch.Tensor], 
+    softmax_sum: Optional[torch.Tensor], 
     block_out: torch.Tensor, 
-    block_mqk: torch.Tensor, 
-    block_se: torch.Tensor,
+    block_softmax_max: torch.Tensor, 
+    block_softmax_sum: torch.Tensor,
+    sub_seq_lens,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         out = block_out.to(torch.float32)
-        mqk = block_mqk
-        se = block_se
+        softmax_max = block_softmax_max
+        softmax_sum = block_softmax_sum
     else:
-        out, mqk, se = _update_forward(out, mqk, se, block_out, block_mqk, block_se)
-    return out, mqk, se
+        out, softmax_max, softmax_sum = _update_forward(out, 
+                                                        softmax_max, 
+                                                        softmax_sum, 
+                                                        block_out, 
+                                                        block_softmax_max, 
+                                                        block_softmax_sum, 
+                                                        sub_seq_lens)
+    return out, softmax_max, softmax_sum
+
+
+def flatten_softmax(x, sub_seq_len):
+    orig_shape = x.shape
+    section_len = [s * orig_shape[1] for s in sub_seq_len]
+    splits = x.view(-1, orig_shape[-1]).split(section_len, dim=0)
+    merged = [item.view(orig_shape[1], -1, orig_shape[-1]).transpose(0, 1) for item in splits]
+    merged = torch.cat(merged, dim=0)
+    return merged
+
+
+def get_sub_seq_lens(cu_seqlens):
+    sub_seq_lens = []
+    for i in range(len(cu_seqlens) - 1):
+        sub_seq_lens.append(cu_seqlens[i+1] - cu_seqlens[i])
+    return sub_seq_lens
 
 
 def ring_flash_attn_varlen_forward(
     process_group,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    q: torch.Tensor, # (total_length, nheads, hidden_dim)
+    k: torch.Tensor, # (total_length, nheads, hidden_dim)
+    v: torch.Tensor, # (total_length, nheads, hidden_dim)
     cu_seqlens,
-    max_seqlen,
     softmax_scale,
+    attn_mask,
     dropout_p=0,
     causal=True,
-    attn_mask=None,
-
 ):
+    assert causal == True, "causal==false is not supported."
+
     comm = RingComm(process_group)
     
     out = None
@@ -80,11 +103,13 @@ def ring_flash_attn_varlen_forward(
     softmax_sum = None
     next_k, next_v = None, None
 
-    # old_softmax = False
+    sub_seq_lens = get_sub_seq_lens(cu_seqlens)
+
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
             next_k, next_v = comm.send_recv_kv(k, v)
-        if not causal or step <= comm.rank:
+
+        if step <= comm.rank:
             outputs = torch_npu.npu_fusion_attention(
                 q,
                 k,
@@ -93,17 +118,24 @@ def ring_flash_attn_varlen_forward(
                 input_layout="TND",
                 atten_mask=attn_mask if step == 0 else None,
                 scale=softmax_scale,
-                keep_prob=1-dropout_p,
                 actual_seq_qlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
                 actual_seq_kvlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
-                sparse_mode=2 if step == 0 else 0,
+                sparse_mode=3,
+                keep_prob=1.0-dropout_p,
             )
             block_out, block_softmax_max, block_softmax_sum, _, _, _, _ = outputs
-            out, softmax_max, softmax_sum = update_forward(out, softmax_max, softmax_sum, block_out, block_softmax_max, block_softmax_sum)
 
-    if step + 1 != comm.world_size:
-        comm.wait()
-        k, v = next_k, next_v
+            out, softmax_max, softmax_sum = update_forward(out, 
+                                                           softmax_max, 
+                                                           softmax_sum, 
+                                                           block_out, 
+                                                           block_softmax_max, 
+                                                           block_softmax_sum, 
+                                                           sub_seq_lens)
+
+        if step + 1 != comm.world_size:
+            comm.wait()
+            k, v = next_k, next_v
     
     out = out.to(q.dtype)
     return out, softmax_max, softmax_sum
@@ -120,16 +152,15 @@ def ring_flash_attn_varlen_backward(
     softmax_max,
     softmax_sum,
     cu_seqlens,
-    max_seqlen,
     softmax_scale,
+    attn_mask,
     dropout_p=0,
     causal=True,
-    attn_mask=None,
 ):
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
     dq, dk, dv = None, None, None
-    
+
     next_dk, next_dv = None, None
     next_k, next_v = None, None
 
@@ -137,8 +168,7 @@ def ring_flash_attn_varlen_backward(
         if step + 1 != kv_comm.world_size:
             next_k, next_v = kv_comm.send_recv_kv(k, v)
         
-        if step <= kv_comm.rank or not causal:
-            bwd_causal = causal and step == 0
+        if step <= kv_comm.rank:
             attn_grad_outs = torch_npu.npu_fusion_attention_grad(
                 q,
                 k,
@@ -146,37 +176,42 @@ def ring_flash_attn_varlen_backward(
                 dout,
                 head_num=q.shape[1],
                 input_layout="TND",
-                atten_mask=attn_mask if bwd_causal else None,
+                atten_mask=attn_mask if step == 0 else None,
                 softmax_max=softmax_max,
                 softmax_sum=softmax_sum,
                 attention_in=out,
                 scale_value=softmax_scale,
-                keep_prob=1-dropout_p,
                 actual_seq_qlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
                 actual_seq_kvlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
-                sparse_mode=2 if bwd_causal else 0,
+                sparse_mode=3,
+                keep_prob=1.0-dropout_p,
             )
 
             if dq is None:
-                dq == attn_grad_outs[0]
+                dq = attn_grad_outs[0].to(torch.float32)
+                dk = attn_grad_outs[1].to(torch.float32)
+                dv = attn_grad_outs[2].to(torch.float32)
+            else:
+                dq += attn_grad_outs[0]
                 d_kv_comm.wait()
                 dk = attn_grad_outs[1] + next_dk
                 dv = attn_grad_outs[2] + next_dv
-            elif step != 0:
-                d_kv_comm.wait()
-                dk, dv = next_dk, next_dv
+        elif step != 0:
+            d_kv_comm.wait()
+            dk, dv = next_dk, next_dv
             
-            if step + 1 != kv_comm.world_size:
-                kv_comm.wait()
-                k, v = next_k, next_v
-            
-            next_dk, next_dv = d_kv_comm.send_recv_kv(dk, dv)
+        if step + 1 != kv_comm.world_size:
+            kv_comm.wait()
+            k, v = next_k, next_v
+        
+        next_dk, next_dv = d_kv_comm.send_recv_kv(dk, dv)
+
     d_kv_comm.wait()
 
     return dq.to(q.dtype), next_dk.to(q.dtype), next_dv.to(q.dtype)
 
 
-class RingFlashAttnVarlenFunc(torch.autograd.Fucntion):
+class RingFlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -184,15 +219,15 @@ class RingFlashAttnVarlenFunc(torch.autograd.Fucntion):
         k,
         v,
         cu_seqlens,
-        max_seqlen,
         dropout_p,
-        softmax_scale,
-        causal,
+        softmax_scale=None,
         attn_mask=None,
+        causal=True,
         group=None,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
+
         if causal and attn_mask is None:
             # Ref: https://www.hiascend.com/document/detail/zh/Pytorch/600/apiref/apilist/ptaoplist_000156.html
             attn_mask = torch.triu(torch.ones([2048, 2048]), diagonal=1).bool().to(q.device)
@@ -205,19 +240,17 @@ class RingFlashAttnVarlenFunc(torch.autograd.Fucntion):
             k,
             v,
             cu_seqlens,
-            max_seqlen,
             softmax_scale=softmax_scale,
+            attn_mask=attn_mask,
             dropout_p=dropout_p,
             causal=causal,
-            attn_mask=attn_mask
         )
-        # this should be out_padded
+
         ctx.save_for_backward(q, k, v, out, softmax_max, softmax_sum, cu_seqlens)
-        ctx.max_seqlen = max_seqlen
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
         ctx.attn_mask = attn_mask
+        ctx.causal = causal
         ctx.group = group
         return out, softmax_max, softmax_sum
 
@@ -234,13 +267,12 @@ class RingFlashAttnVarlenFunc(torch.autograd.Fucntion):
             softmax_max,
             softmax_sum,
             cu_seqlens,
-            ctx.max_seqlen,
             softmax_scale=ctx.softmax_scale,
+            attn_mask=ctx.attn_mask,
             dropout_p=ctx.dropout_p,
             causal=ctx.causal,
-            attn_mask=ctx.attn_mask,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None
 
 
 def ring_flash_attn_varlen_func(
@@ -248,10 +280,10 @@ def ring_flash_attn_varlen_func(
     k,
     v,
     cu_seqlens,
-    max_seqlen,
     dropout_p=0.0,
     softmax_scale=None,
-    causal=False,
+    attn_mask=None,
+    causal=True,
     group=None,
 ):
     return RingFlashAttnVarlenFunc.apply(
@@ -259,9 +291,9 @@ def ring_flash_attn_varlen_func(
         k,
         v,
         cu_seqlens,
-        max_seqlen,
         dropout_p,
         softmax_scale,
+        attn_mask,
         causal,
         group,
     )
