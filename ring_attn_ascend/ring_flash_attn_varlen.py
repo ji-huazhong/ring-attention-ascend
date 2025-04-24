@@ -94,7 +94,7 @@ def ring_flash_attn_varlen_forward(
     dropout_p=0,
     causal=True,
 ):
-    assert causal == True, "causal==false is not supported."
+    assert causal == True, "causal==False is not supported."
 
     comm = RingComm(process_group)
     
@@ -230,7 +230,7 @@ class RingFlashAttnVarlenFunc(torch.autograd.Function):
 
         if causal and attn_mask is None:
             # Ref: https://www.hiascend.com/document/detail/zh/Pytorch/600/apiref/apilist/ptaoplist_000156.html
-            attn_mask = torch.triu(torch.ones([2048, 2048]), diagonal=1).bool().to(q.device)
+            attn_mask = torch.triu(torch.ones([2048, 2048], device=q.device), diagonal=1).bool()
 
         k = k.contiguous()
         v = v.contiguous()
