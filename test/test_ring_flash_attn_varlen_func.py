@@ -94,7 +94,7 @@ if __name__ == "__main__":
         print("# forward:")
         print("#" * 30)
 
-    attn_mask = torch.triu(torch.ones([2048, 2048]), diagonal=1).bool().to(q.device)
+    attn_mask = torch.triu(torch.ones([2048, 2048], device=q.device), diagonal=1).bool()
     out, softmax_max, softmax_sum, _, _, _, _ = torch_npu.npu_fusion_attention(
         q,
         k,
