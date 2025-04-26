@@ -6,7 +6,7 @@ try:
 except ImportError:
     print("Failed to import torch_npu.")
 
-from .utils import RingComm
+from .utils import RingComm, flatten_softmax, get_sub_seq_lens
 
 
 def _update_forward(
@@ -57,30 +57,11 @@ def update_forward(
         softmax_max = block_softmax_max
         softmax_sum = block_softmax_sum
     else:
-        out, softmax_max, softmax_sum = _update_forward(out, 
-                                                        softmax_max, 
-                                                        softmax_sum, 
-                                                        block_out, 
-                                                        block_softmax_max, 
-                                                        block_softmax_sum, 
-                                                        sub_seq_lens)
+        out, softmax_max, softmax_sum = _update_forward(
+            out, softmax_max, softmax_sum, block_out, block_softmax_max, block_softmax_sum, sub_seq_lens
+        )
+
     return out, softmax_max, softmax_sum
-
-
-def flatten_softmax(x, sub_seq_len):
-    orig_shape = x.shape
-    section_len = [s * orig_shape[1] for s in sub_seq_len]
-    splits = x.view(-1, orig_shape[-1]).split(section_len, dim=0)
-    merged = [item.view(orig_shape[1], -1, orig_shape[-1]).transpose(0, 1) for item in splits]
-    merged = torch.cat(merged, dim=0)
-    return merged
-
-
-def get_sub_seq_lens(cu_seqlens):
-    sub_seq_lens = []
-    for i in range(len(cu_seqlens) - 1):
-        sub_seq_lens.append(cu_seqlens[i+1] - cu_seqlens[i])
-    return sub_seq_lens
 
 
 def ring_flash_attn_varlen_forward(
@@ -125,13 +106,9 @@ def ring_flash_attn_varlen_forward(
             )
             block_out, block_softmax_max, block_softmax_sum, _, _, _, _ = outputs
 
-            out, softmax_max, softmax_sum = update_forward(out, 
-                                                           softmax_max, 
-                                                           softmax_sum, 
-                                                           block_out, 
-                                                           block_softmax_max, 
-                                                           block_softmax_sum, 
-                                                           sub_seq_lens)
+            out, softmax_max, softmax_sum = update_forward(
+                out, softmax_max, softmax_sum, block_out, block_softmax_max, block_softmax_sum, sub_seq_lens
+            )
 
         if step + 1 != comm.world_size:
             comm.wait()
