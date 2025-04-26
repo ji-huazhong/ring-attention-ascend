@@ -5,6 +5,31 @@ import torch
 import torch.distributed as dist
 
 
+def flatten_softmax(x, sub_seq_lens):
+    orig_shape = x.shape
+    section_len = [s * orig_shape[1] for s in sub_seq_lens]
+    splits = x.view(-1, orig_shape[-1]).split(section_len, dim=0)
+    merged = [item.view(orig_shape[1], -1, orig_shape[-1]).transpose(0, 1) for item in splits]
+    merged = torch.cat(merged, dim=0)
+    return merged
+
+
+def unflatten_softmax(x, cu_seqlens):
+    orig_shape = x.shape
+    x_seq_list = []
+    for i in range(len(cu_seqlens) - 1):
+        start, end = cu_seqlens[i], cu_seqlens[i+1]
+        x_seq_list.append(x[start:end].transpose(1, 0).reshape(-1, orig_shape[-2], orig_shape[-1]))
+    return torch.cat(x_seq_list, dim=0)
+
+
+def get_sub_seq_lens(cu_seqlens):
+    sub_seq_lens = []
+    for i in range(len(cu_seqlens) - 1):
+        sub_seq_lens.append(cu_seqlens[i+1] - cu_seqlens[i])
+    return sub_seq_lens
+
+
 class RingComm:
     def __init__(self, process_group: dist.ProcessGroup):
         self._process_group = process_group
