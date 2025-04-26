@@ -1,5 +1,5 @@
 """
-torchrun --nproc_per_node=4 test_ring_flash_func.py
+torchrun --nproc_per_node=8 test_ring_flash_func.py
 """
 
 import torch

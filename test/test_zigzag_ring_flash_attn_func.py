@@ -1,5 +1,5 @@
 """
-torchrun --nproc_per_node=8 test_zigzag_ring_flash_attn_func.py
+torchrun --nproc_per_node=4 test_zigzag_ring_flash_attn_func.py
 """
 
 import torch
@@ -33,6 +33,7 @@ if __name__ == "__main__":
     seqlen = 3824
     nheads = 5
     d = 128
+    dropout_p = 0
     causal = True
 
     assert causal
@@ -69,8 +70,7 @@ if __name__ == "__main__":
         print("# forward:")
         print("#" * 30)
     
-    attn_mask = torch.ones((q.shape[1], k.shape[1]), dtype=torch.bool, device=q.device)
-    attn_mask = torch.triu(attn_mask, diagonal=1)
+    attn_mask = torch.triu(torch.ones([2048, 2048], device=q.device), diagonal=1).bool()
     out, softmax_max, softmax_sum, _, _, _, _ = torch_npu.npu_fusion_attention(
         q,
         k,
@@ -81,7 +81,8 @@ if __name__ == "__main__":
         scale=d ** (-0.5),
         pre_tockens=k.shape[1],
         next_tockens=0,
-        keep_prob=1,
+        sparse_mode=3,
+        keep_prob=1.0-dropout_p,
     )
 
     local_out = extract_local(out, rank, world_size)
@@ -124,3 +125,5 @@ if __name__ == "__main__":
     log("dq diff", local_dq - ring_dq)
     log("dk diff", local_dk - ring_dk)
     log("dv diff", local_dv - ring_dv)
+
+    dist.destroy_process_group()
