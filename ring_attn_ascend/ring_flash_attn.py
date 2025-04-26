@@ -68,7 +68,8 @@ def ring_flash_attn_forward(
     k: torch.Tensor, # (batch_size, seqlen, nheads_k, headdim)
     v: torch.Tensor, # (batch_size, seqlen, nheads_k, headdim)
     softmax_scale,
-    attn_mask=None,
+    attn_mask,
+    dropout_p=0,
     causal=True,
 ):
     assert causal == True, "causal==false is not supported."
@@ -95,7 +96,8 @@ def ring_flash_attn_forward(
                 scale=softmax_scale,
                 pre_tockens=k.shape[1],
                 next_tockens=0,
-                keep_prob=1,
+                sparse_mode=3,
+                keep_prob=1.0-dropout_p,
             )
             block_out, block_mqk, block_se, _, _, _, _ = outputs
             out, mqk, se = update_forward(out, mqk, se, block_out, block_mqk, block_se)
@@ -116,10 +118,11 @@ def ring_flash_attn_backward(
     k,
     v,
     out,
-    softmax_scale,
-    attn_mask,
     softmax_max,
     softmax_sum,
+    softmax_scale,
+    attn_mask,
+    dropout_p=0,
     causal=True,
 ):
     kv_comm = RingComm(process_group)
@@ -148,6 +151,8 @@ def ring_flash_attn_backward(
                 scale_value=softmax_scale,
                 pre_tockens=k.shape[1],
                 next_tockens=0,
+                sparse_mode=3,
+                keep_prob=1.0-dropout_p,
             )
 
             if dq is None:
@@ -181,6 +186,7 @@ class RingFlashAttnFunc(torch.autograd.Function):
         q, # (batch_size, seqlen, nheads, headdim)
         k, # (batch_size, seqlen, nheads_k, headdim)
         v, # (batch_size, seqlen, nheads_k, headdim)
+        dropout_p,
         softmax_scale=None,
         attn_mask=None,
         causal=True,
@@ -190,8 +196,8 @@ class RingFlashAttnFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
 
         if causal and attn_mask is None:
-            attn_mask = torch.ones((q.shape[1], k.shape[1]), dtype=torch.bool, device=q.device)
-            attn_mask = torch.triu(attn_mask, diagonal=1)
+            # Ref: https://www.hiascend.com/document/detail/zh/Pytorch/600/apiref/apilist/ptaoplist_000156.html
+            attn_mask = torch.triu(torch.ones([2048, 2048], device=q.device), diagonal=1).bool()
         
         k = k.contiguous()
         v = v.contiguous()
@@ -202,9 +208,11 @@ class RingFlashAttnFunc(torch.autograd.Function):
             v,
             softmax_scale=softmax_scale,
             attn_mask=attn_mask,
+            dropout_p=dropout_p,
             causal=causal,
         )
         ctx.save_for_backward(q, k, v, out, softmax_max, softmax_sum)
+        ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.attn_mask = attn_mask
         ctx.causal = causal
@@ -222,18 +230,21 @@ class RingFlashAttnFunc(torch.autograd.Function):
             k,
             v,
             out,
-            ctx.softmax_scale,
+            softmax_max,
+            softmax_sum,
+            softmax_scale=ctx.softmax_scale,
             attn_mask=ctx.attn_mask,
-            softmax_max=softmax_max,
-            softmax_sum=softmax_sum,
+            dropout_p=ctx.dropout_p,
+            causal=ctx.causal,
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 def ring_flash_attn_func(
     q,
     k,
     v,
+    dropout_p=0.0,
     softmax_scale=None,
     attn_mask=None,
     causal=True,
@@ -243,6 +254,7 @@ def ring_flash_attn_func(
         q,
         k,
         v,
+        dropout_p,
         softmax_scale,
         attn_mask,
         causal,
